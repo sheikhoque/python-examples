@@ -7,6 +7,7 @@ import logging
 import argparse
 import io
 import zipfile
+import gzip
 
 dynamo = boto3.resource('dynamodb')
 s3 = boto3.resource('s3')
@@ -149,7 +150,8 @@ def item_exist(metadata_tbl, file_name):
         return False
     return True
 
-
+# updates dynamo db metastore status based on lifecycle of the process
+# such as reading file, converted to datafame, send to kinesis or failed status
 def update_file(metadata_writer, status, file_name, file_format, dest_kds, reason="ok"):
     if status == 'reading_file':
         if item_exist(metadata_writer, file_name):
@@ -210,7 +212,7 @@ def get_file_separator(file_format):
 def check_file_root(file_path):
     return file_path.split("://")[0]
 
-
+# reads s3 file - regular, zip or gzip
 def read_s3_file(file_path, is_file_zipped, sep, header):
     (bucket, file_key) = parse_s3_file_path(file_path)
     obj = s3.Object(bucket, file_key)
@@ -218,24 +220,30 @@ def read_s3_file(file_path, is_file_zipped, sep, header):
         body = obj.get()['Body']
         dataframe = pd.read_csv(body, sep=sep, header=header, low_memory=False)
     else:
-        s3_file = S3File(obj)
-        with zipfile.ZipFile(s3_file) as zf:
-            for file in zf.namelist():
-                with zf.open(file) as content:
-                    dataframe = pd.read_csv(content, sep=sep, header=header, low_memory=False)
+        if ".gz" in file_key:
+            body = obj.get()['Body']
+            dataframe = pd.read_csv(body, sep=sep, compression='gzip', header=header, low_memory=False)
+        elif ".zip" in file_key:
+            s3_file = S3File(obj)
+            with zipfile.ZipFile(s3_file) as zf:
+                for file in zf.namelist():
+                    with zf.open(file) as content:
+                        dataframe = pd.read_csv(content, sep=sep, header=header, low_memory=False)
     return dataframe
 
-
+# reads file with defined configuration - header_exists, file_format, file_path, is_file_zipped, column_names
+# it can read file from s3 or local/NAS  path. based on parsing file_path it
+# figures out whether file is in s3. The method can read comma, tab, space, pipe separated format
 def read_file(file_format, header_exist, column_names, file_path, is_file_zipped):
     header = 0 if header_exist else None
     columns = [col.strip() for col in column_names.split(",")]
     sep = get_file_separator(file_format)
     try:
-        if file_format in ('csv', 'tab', 'space', 'pipe'):
+        if file_format in ('comma', 'tab', 'space', 'pipe'):
             if check_file_root(file_path) == "s3":
                 dataframe = read_s3_file(file_path, is_file_zipped, sep, header)
             else:
-                dataframe = pd.read_csv(file_path, sep=sep, header=header, low_memory=False, compression='zip')
+                dataframe = pd.read_csv(file_path, sep=sep, header=header, low_memory=False)
         else:
             return 0, "unknown file format"
     except Exception as e:
@@ -261,7 +269,9 @@ def parse_s3_file_path(s3_loc):
     s3_path = s3loc_array[index + 1:len(s3loc_array)]
     return bucket, s3_path
 
-
+# starts the process, connects to dynamodb to read config and meta table
+# reads the file from s3 and writes to kinesis
+# keeps track of life cycle [reading file, writing to kinesis] in dynamodb meta table
 def run_process(config_table, meta_table, service_type, file_path):
     (status, dynamo_config) = read_config_dynamo(config_table, service_type, file_path[0:file_path.rfind("/") + 1])
     if status == 0:
@@ -310,6 +320,23 @@ def main(args):
     service_type = args.service
     run_process(config_table, meta_table, service_type, file_path)
 
+# This script receives the s3 file path
+# and reads the file and send to kinesis
+# and once received forwards it to s3_to_kinesis.py script
+#   input arguments:
+#     config      - name of the dynamo db config table
+#     metastore   - name of the metatore table of dynamo db
+#     service     - defaulted to lambda, this is the primary key in dynamodb config table
+#     filepath    - absolute path of the file
+# dynamodb config table defines few factors for the code to act on such as
+#     data format - supported formats --> comma, tab, space, pipe
+#     header_exists - a boolean , true defines head exists and false is no header
+#     file_is_zipped - a boolean, true defines file is zipped, false is not zipped
+#     service - defines where the script is running - lambda, EC2, ECS etc
+#     file_path - defines the folder in S3 that is monitored for new file
+#     column_names - name of the columns in comma separated. This is required if
+#                    header_exists is false and we want to stitch column header to data
+#                    at present it is required if header_exists is false
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(prog='s3_to_kinesis_data_pumper',
@@ -321,7 +348,7 @@ if __name__ == '__main__':
     parser.add_argument('--metastore', action="store", type=str, default="carters_streaming_metadata",
                         help="The name of metastore table in dynamo")
     parser.add_argument('--filepath', action="store", type=str,
-                        default="s3://airflow-emr-smh/carters/clickstream/tab/test.tsv",
+                        default="s3://airflow-emr-smh/carters/clickstream/tab/test.tsv.zip",
                         help="absolute file path")
     parser.add_argument('--service', action="store", type=str,
                         default="lambda",

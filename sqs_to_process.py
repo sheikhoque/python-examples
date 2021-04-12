@@ -42,11 +42,18 @@ def main(args):
     while True:
         (file_path, receipt_handle) = receive_message(queue_url)
         s3_to_kinesis.run_process(config_table, meta_table, service_type,
-                                  "s3://airflow-emr-smh/carters/clickstream/tab/test3.tsv")
+                                  file_path)
         delete_message(queue_url, receipt_handle)
         time.sleep(60)
 
 
+# This script polls a sqs to receive a absolute file path in s3
+# and once received forwards it to s3_to_kinesis.py script
+#   input arguments:
+#     queue_name  - name of the sqs queue
+#     config      - name of the dynamo db config table
+#     metastore   - name of the metatore table of dynamo db
+#     service     - defaulted to lambda, this is the primary key in dynamodb config table
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(prog='sqs_to_process_triggers',
                                      description='Reads the file name from SQS and trigger python process to read the '
