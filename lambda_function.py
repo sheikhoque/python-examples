@@ -1,12 +1,22 @@
+import json
+import logging
+import os
+import re
 import boto3
 from botocore.exceptions import ClientError
 import datetime
 import pandas as pd
-import logging
 import argparse
 import io
 import zipfile
-import re
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+config_table = os.getenv("db_config_table")
+meta_table = os.getenv("db_metastore_table")
+file_prefix = os.getenv("file_prefix")
+
 
 dynamo = boto3.resource('dynamodb')
 s3 = boto3.resource('s3')
@@ -286,10 +296,10 @@ def run_process(config_table, meta_table, service_type, file_path):
     metadata_writer = connect_dynamo_tbl(meta_table)
 
     # insert loading status for file
+    logging.info("reading file ..")
     update_file(metadata_writer, "reading_file", file_path, dynamo_config['source_data_format'],
                 dynamo_config['dest_kds_stream'])
     # read s3 file
-    logging.info("reading file ..")
     read_response = read_file(dynamo_config['source_data_format'], dynamo_config['header_exist'],
                               dynamo_config['column_names'], file_path, dynamo_config['is_file_zipped'])
 
@@ -305,8 +315,8 @@ def run_process(config_table, meta_table, service_type, file_path):
         logging.info("failed at file reading {}".format(read_response[1]))
         exit(1)
     dataframe = read_response[1]
-    # send data to kinesis
     logging.info("started sending data to kinesis")
+    # send data to kinesis
     response = send_to_kinesis(dynamo_config['dest_kds_stream'], dataframe)
     if response is not None:
         # update status of file to "processed_and_sent_to_kds"
@@ -320,53 +330,16 @@ def run_process(config_table, meta_table, service_type, file_path):
         exit(1)
     logging.info("Process finished")
 
-
-def main(args):
-    # read config files
-    file_path = args.filepath
-    config_table = args.config
-    meta_table = args.metastore
-    service_type = args.service
-    file_prefix = args.fileprefix
-    filename_only = file_path[file_path.rindex("/") + 1: len(file_path)]
-    if not re.search(file_prefix, filename_only):
-        logging.info("file {} does not have required prefix {}, ignoring the file.".format(filename_only, file_prefix))
-        return
-    run_process(config_table, meta_table, service_type, file_path)
-
-# This script receives the s3 file path
-# and reads the file and send to kinesis
-# and once received forwards it to s3_to_kinesis.py script
-#   input arguments:
-#     config      - name of the dynamo db config table
-#     metastore   - name of the metatore table of dynamo db
-#     service     - defaulted to lambda, this is the primary key in dynamodb config table
-#     filepath    - absolute path of the file
-# dynamodb config table defines few factors for the code to act on such as
-#     data format - supported formats --> comma, tab, space, pipe
-#     header_exists - a boolean , true defines head exists and false is no header
-#     file_is_zipped - a boolean, true defines file is zipped, false is not zipped
-#     service - defines where the script is running - lambda, EC2, ECS etc
-#     file_path - defines the folder in S3 that is monitored for new file
-#     column_names - name of the columns in comma separated. This is required if
-#                    header_exists is false and we want to stitch column header to data
-#                    at present it is required if header_exists is false
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(prog='s3_to_kinesis_data_pumper',
-                                     description='Adobe analytics sends clickstream data to S3. This application '
-                                                 'reads every landed file and sends clickstream data to kinesis.')
-
-    parser.add_argument('--config', action="store", type=str, default="carters_clickstream_config",
-                        help="The name of config table in dynamo")
-    parser.add_argument('--metastore', action="store", type=str, default="carters_streaming_metadata",
-                        help="The name of metastore table in dynamo")
-    parser.add_argument('--filepath', action="store", type=str,
-                        default="s3://ka-app-code-uswest2-smh/carters/clickstream/tab/input/75-abctsv.gz",
-                        help="absolute file path")
-    parser.add_argument('--service', action="store", type=str,
-                        default="lambda",
-                        help="configuration for service")
-    parser.add_argument('--fileprefix', action="store", default="\d+-\w+", help=" prefix of file name")
-
-    main(parser.parse_args())
+def lambda_handler(event, context):
+    for record in event['Records']:
+        filekey = record['s3']['object']['key']
+        bucket = record['s3']['bucket']['name']
+        filename_only = filekey[filekey.rindex("/")+1 : len(filekey)]
+        if not re.search(file_prefix, filename_only):
+            logger.info("file {} does not have required prefix {}, ignoring the file.".format(filename_only, file_prefix))
+            break
+        s3_file_path = "s3://"+bucket+"/"+filekey
+        logger.info("s3 file path {}".format(s3_file_path))
+        logger.info("start processing")
+        service_type="lambda"
+        run_process(config_table, meta_table, service_type, s3_file_path)
